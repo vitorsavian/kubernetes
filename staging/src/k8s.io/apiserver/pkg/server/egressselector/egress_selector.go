@@ -36,6 +36,7 @@ import (
 
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apiserver/pkg/apis/apiserver"
+	"k8s.io/apiserver/pkg/server/dynamiccertificates"
 	egressmetrics "k8s.io/apiserver/pkg/server/egressselector/metrics"
 	"k8s.io/component-base/metrics/legacyregistry"
 	"k8s.io/component-base/tracing"
@@ -51,7 +52,8 @@ func init() {
 
 // EgressSelector is the map of network context type to context dialer, for network egress.
 type EgressSelector struct {
-	egressToDialer map[EgressType]utilnet.DialFunc
+	egressToDialer        map[EgressType]utilnet.DialFunc
+	clientCertControllers []dynamiccertificates.ControllerRunner
 }
 
 // EgressType is an indicator of which egress selection should be used for sending traffic.
@@ -241,9 +243,10 @@ func (u *udsGRPCConnector) connect(_ context.Context) (proxier, error) {
 }
 
 type dialerCreator struct {
-	connector proxyServerConnector
-	direct    bool
-	options   metricsOptions
+	connector            proxyServerConnector
+	direct               bool
+	options              metricsOptions
+	clientCertController dynamiccertificates.ControllerRunner
 }
 
 type metricsOptions struct {
@@ -331,6 +334,16 @@ func connectionToDialerCreator(c apiserver.Connection) (*dialerCreator, error) {
 			if err != nil {
 				return nil, err
 			}
+			// Load the client cert dynamically so it can be rotated without a restart.
+			clientCert, err := dynamiccertificates.NewDynamicServingContentFromFiles("egress-selector-client-cert", c.Transport.TCP.TLSConfig.ClientCert, c.Transport.TCP.TLSConfig.ClientKey)
+			if err != nil {
+				return nil, err
+			}
+			tlsConfig.Certificates = nil
+			tlsConfig.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+				cert, err := tls.X509KeyPair(clientCert.CurrentCertKeyContent())
+				return &cert, err
+			}
 			proxyAddress, err := getProxyAddress(c.Transport.TCP.URL)
 			if err != nil {
 				return nil, err
@@ -344,6 +357,7 @@ func connectionToDialerCreator(c apiserver.Connection) (*dialerCreator, error) {
 					transport: egressmetrics.TransportTCP,
 					protocol:  egressmetrics.ProtocolHTTPConnect,
 				},
+				clientCertController: clientCert,
 			}, nil
 		} else {
 			return nil, fmt.Errorf("Either a TCP or UDS transport must be specified")
@@ -389,6 +403,9 @@ func NewEgressSelector(config *apiserver.EgressSelectorConfiguration) (*EgressSe
 			return nil, fmt.Errorf("failed to create dialer for egressSelection %q: %v", name, err)
 		}
 		cs.egressToDialer[name] = dialerCreator.createDialer()
+		if dialerCreator.clientCertController != nil {
+			cs.clientCertControllers = append(cs.clientCertControllers, dialerCreator.clientCertController)
+		}
 	}
 	return cs, nil
 }
@@ -401,6 +418,14 @@ func NewEgressSelectorWithMap(m map[EgressType]utilnet.DialFunc) *EgressSelector
 	return &EgressSelector{
 		egressToDialer: m,
 	}
+}
+
+// ClientCertControllers returns the controllers that reload client certificates from disk.
+func (cs *EgressSelector) ClientCertControllers() []dynamiccertificates.ControllerRunner {
+	if cs == nil {
+		return nil
+	}
+	return cs.clientCertControllers
 }
 
 // Lookup gets the dialer function for the network context.

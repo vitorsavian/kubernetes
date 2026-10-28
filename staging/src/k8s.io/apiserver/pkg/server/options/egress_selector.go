@@ -74,6 +74,14 @@ func (o *EgressSelectorOptions) ApplyTo(c *server.Config) error {
 		return fmt.Errorf("failed to setup egress selector with config %#v: %v", npConfig, err)
 	}
 	c.EgressSelector = cs
+	if controllers := cs.ClientCertControllers(); len(controllers) > 0 {
+		return c.AddPostStartHook("egress-selector-reload-client-cert", func(ctx server.PostStartHookContext) error {
+			for _, controller := range controllers {
+				go controller.Run(ctx, 1)
+			}
+			return nil
+		})
+	}
 	return nil
 }
 
