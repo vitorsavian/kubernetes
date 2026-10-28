@@ -17,7 +17,9 @@ limitations under the License.
 package egressselector
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -402,5 +404,75 @@ func TestGetTLSConfig(t *testing.T) {
 				t.Errorf("expected ServerName %q, got %q", tc.expectedServerName, tlsConfig.ServerName)
 			}
 		})
+	}
+}
+
+func TestGetTLSConfigReloadsClientCert(t *testing.T) {
+	tempDir := t.TempDir()
+	certPath := filepath.Join(tempDir, "client.crt")
+	keyPath := filepath.Join(tempDir, "client.key")
+
+	writeCertKey := func(host string) []byte {
+		t.Helper()
+		certPEM, keyPEM, err := certutil.GenerateSelfSignedCertKey(host, nil, nil)
+		if err != nil {
+			t.Fatalf("Failed to generate test certificates: %v", err)
+		}
+		if err := os.WriteFile(certPath, certPEM, 0600); err != nil {
+			t.Fatalf("Failed to write cert file: %v", err)
+		}
+		if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
+			t.Fatalf("Failed to write key file: %v", err)
+		}
+		return certPEM
+	}
+	assertClientCert := func(tlsConfig *tls.Config, wantPEM []byte) {
+		t.Helper()
+		cert, err := tlsConfig.GetClientCertificate(&tls.CertificateRequestInfo{})
+		if err != nil {
+			t.Fatalf("GetClientCertificate returned unexpected error: %v", err)
+		}
+		want, err := certutil.ParseCertsPEM(wantPEM)
+		if err != nil {
+			t.Fatalf("Failed to parse expected cert: %v", err)
+		}
+		if !bytes.Equal(cert.Certificate[0], want[0].Raw) {
+			t.Errorf("expected client cert for %q, got a different certificate", want[0].Subject.CommonName)
+		}
+	}
+
+	firstPEM := writeCertKey("first")
+	tlsConfig, err := getTLSConfig(&apiserver.TLSConfig{ClientCert: certPath, ClientKey: keyPath})
+	if err != nil {
+		t.Fatalf("getTLSConfig returned unexpected error: %v", err)
+	}
+	if len(tlsConfig.Certificates) != 0 {
+		t.Errorf("expected client cert to be provided by GetClientCertificate, got %d static certificates", len(tlsConfig.Certificates))
+	}
+	assertClientCert(tlsConfig, firstPEM)
+
+	secondPEM := writeCertKey("second")
+	assertClientCert(tlsConfig, secondPEM)
+
+	// A cert that does not match the key, as seen while the files are being replaced,
+	// falls back to the previously loaded certificate.
+	thirdPEM, _, err := certutil.GenerateSelfSignedCertKey("third", nil, nil)
+	if err != nil {
+		t.Fatalf("Failed to generate test certificates: %v", err)
+	}
+	if err := os.WriteFile(certPath, thirdPEM, 0600); err != nil {
+		t.Fatalf("Failed to write cert file: %v", err)
+	}
+	assertClientCert(tlsConfig, secondPEM)
+}
+
+func TestGetTLSConfigMissingClientCert(t *testing.T) {
+	tempDir := t.TempDir()
+	_, err := getTLSConfig(&apiserver.TLSConfig{
+		ClientCert: filepath.Join(tempDir, "missing.crt"),
+		ClientKey:  filepath.Join(tempDir, "missing.key"),
+	})
+	if err == nil {
+		t.Fatal("expected getTLSConfig to fail when the client cert does not exist")
 	}
 }

@@ -28,6 +28,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -276,12 +277,10 @@ func (d *dialerCreator) createDialer() utilnet.DialFunc {
 }
 
 func getTLSConfig(t *apiserver.TLSConfig) (*tls.Config, error) {
-	clientCert := t.ClientCert
-	clientKey := t.ClientKey
 	caCert := t.CABundle
-	clientCerts, err := tls.LoadX509KeyPair(clientCert, clientKey)
+	clientCerts, err := newClientCertReloader(t.ClientCert, t.ClientKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read key pair %s & %s, got %v", clientCert, clientKey, err)
+		return nil, err
 	}
 	certPool := x509.NewCertPool()
 	if caCert != "" {
@@ -298,10 +297,52 @@ func getTLSConfig(t *apiserver.TLSConfig) (*tls.Config, error) {
 		certPool = nil
 	}
 	return &tls.Config{
-		Certificates: []tls.Certificate{clientCerts},
-		RootCAs:      certPool,
-		ServerName:   t.TLSServerName,
+		GetClientCertificate: clientCerts.GetClientCertificate,
+		RootCAs:              certPool,
+		ServerName:           t.TLSServerName,
 	}, nil
+}
+
+// clientCertReloader loads the client certificate and key from disk on each TLS handshake, so
+// that new connections use a rotated certificate without restarting the apiserver. If the files
+// cannot be loaded, for example while they are being replaced, the last certificate that was
+// loaded successfully is used.
+type clientCertReloader struct {
+	certFile string
+	keyFile  string
+
+	lock sync.Mutex
+	cert *tls.Certificate
+}
+
+func newClientCertReloader(certFile, keyFile string) (*clientCertReloader, error) {
+	r := &clientCertReloader{certFile: certFile, keyFile: keyFile}
+	if _, err := r.load(); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (r *clientCertReloader) load() (*tls.Certificate, error) {
+	cert, err := tls.LoadX509KeyPair(r.certFile, r.keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read key pair %s & %s, got %v", r.certFile, r.keyFile, err)
+	}
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	r.cert = &cert
+	return &cert, nil
+}
+
+func (r *clientCertReloader) GetClientCertificate(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+	cert, err := r.load()
+	if err != nil {
+		klog.ErrorS(err, "Failed to reload egress client certificate, using previously loaded certificate")
+		r.lock.Lock()
+		defer r.lock.Unlock()
+		return r.cert, nil
+	}
+	return cert, nil
 }
 
 func getProxyAddress(urlString string) (string, error) {
