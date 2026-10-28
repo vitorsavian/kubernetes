@@ -20,13 +20,11 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
@@ -37,6 +35,7 @@ import (
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apiserver/pkg/apis/apiserver"
 	egressmetrics "k8s.io/apiserver/pkg/server/egressselector/metrics"
+	"k8s.io/client-go/transport"
 	"k8s.io/component-base/metrics/legacyregistry"
 	"k8s.io/component-base/tracing"
 	"k8s.io/klog/v2"
@@ -276,32 +275,24 @@ func (d *dialerCreator) createDialer() utilnet.DialFunc {
 }
 
 func getTLSConfig(t *apiserver.TLSConfig) (*tls.Config, error) {
-	clientCert := t.ClientCert
-	clientKey := t.ClientKey
-	caCert := t.CABundle
-	clientCerts, err := tls.LoadX509KeyPair(clientCert, clientKey)
+	// The client cert and key files are reloaded by the client-go transport, so that new
+	// connections use a rotated certificate without restarting the apiserver.
+	tlsConfig, err := transport.TLSConfigFor(&transport.Config{
+		TLS: transport.TLSConfig{
+			CAFile:     t.CABundle,
+			CertFile:   t.ClientCert,
+			KeyFile:    t.ClientKey,
+			ServerName: t.TLSServerName,
+		},
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to read key pair %s & %s, got %v", clientCert, clientKey, err)
+		return nil, fmt.Errorf("failed to load TLS config: %w", err)
 	}
-	certPool := x509.NewCertPool()
-	if caCert != "" {
-		certBytes, err := os.ReadFile(caCert)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read cert file %s, got %v", caCert, err)
-		}
-		ok := certPool.AppendCertsFromPEM(certBytes)
-		if !ok {
-			return nil, fmt.Errorf("failed to append CA cert to the cert pool")
-		}
-	} else {
-		// Use host's root CA set instead of providing our own
-		certPool = nil
+	// Load the key pair now, so that a missing or invalid key pair is reported at startup.
+	if _, err := tlsConfig.GetClientCertificate(nil); err != nil {
+		return nil, fmt.Errorf("failed to read key pair %s & %s, got %v", t.ClientCert, t.ClientKey, err)
 	}
-	return &tls.Config{
-		Certificates: []tls.Certificate{clientCerts},
-		RootCAs:      certPool,
-		ServerName:   t.TLSServerName,
-	}, nil
+	return tlsConfig, nil
 }
 
 func getProxyAddress(urlString string) (string, error) {
